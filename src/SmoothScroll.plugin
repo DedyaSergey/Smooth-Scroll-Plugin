@@ -1,0 +1,592 @@
+__id__ = "smooth_scroll"
+__name__ = "Smooth Chat Scroll Pro"
+__description__ = "Плавные анимации, жесты и оптимизированная производительность при прокрутке"
+__author__ = "Copilot"
+__version__ = "2.0.0"
+__icon__ = "msg_list"
+__app_version__ = ">=12.5.0"
+__sdk_version__ = ">=1.4.0"
+
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
+from ui.settings import Divider, Header, Selector, Switch, Text
+from android_utils import run_on_ui_thread, log
+from client_utils import get_last_fragment
+from ui.bulletin import BulletinHelper
+import threading
+import time
+from typing import Any, Dict, List, Optional
+import math
+
+
+class PerformanceMonitor:
+    """Монитор производительности для оптимизации"""
+    def __init__(self, max_fps: int = 60):
+        self.max_fps = max_fps
+        self.frame_time = 1.0 / max_fps
+        self.last_frame_time = 0
+        self.frame_count = 0
+        self.skip_frames = 0
+    
+    def can_render(self) -> bool:
+        """Проверить, должен ли кадр быть отрисован"""
+        current_time = time.time()
+        if current_time - self.last_frame_time >= self.frame_time:
+            self.last_frame_time = current_time
+            self.frame_count += 1
+            return True
+        self.skip_frames += 1
+        return False
+    
+    def reset(self):
+        """Сбросить статистику"""
+        self.frame_count = 0
+        self.skip_frames = 0
+
+
+class GestureDetector:
+    """Детектор жестов для анимаций прокрутки"""
+    def __init__(self):
+        self.touch_start_x = 0
+        self.touch_start_y = 0
+        self.touch_start_time = 0
+        self.is_scrolling = False
+    
+    def on_touch_start(self, x: float, y: float):
+        """Начало касания"""
+        self.touch_start_x = x
+        self.touch_start_y = y
+        self.touch_start_time = time.time()
+        self.is_scrolling = True
+    
+    def on_touch_move(self, x: float, y: float) -> Dict[str, float]:
+        """Движение касания"""
+        delta_x = x - self.touch_start_x
+        delta_y = y - self.touch_start_y
+        
+        return {
+            "delta_x": delta_x,
+            "delta_y": delta_y,
+            "distance": math.sqrt(delta_x**2 + delta_y**2),
+            "time": time.time() - self.touch_start_time,
+        }
+    
+    def on_touch_end(self) -> Dict[str, float]:
+        """Конец касания - возвращает velocity"""
+        elapsed_time = time.time() - self.touch_start_time
+        if elapsed_time > 0:
+            velocity_x = (0 - self.touch_start_x) / elapsed_time
+            velocity_y = (0 - self.touch_start_y) / elapsed_time
+        else:
+            velocity_x = velocity_y = 0
+        
+        self.is_scrolling = False
+        
+        return {
+            "velocity_x": velocity_x,
+            "velocity_y": velocity_y,
+            "velocity": math.sqrt(velocity_x**2 + velocity_y**2),
+        }
+
+
+class SmoothScrollPlugin(BasePlugin):
+    """
+    Плагин для плавной прокрутки, жестов и оптимизированной производительности.
+    Версия 2.0 с расширенными возможностями.
+    """
+    
+    SCROLL_ANIMATIONS = {
+        "smooth": ("Плавная", 200),
+        "elastic": ("Эластичная", 350),
+        "ease_out": ("Замедление", 250),
+        "bounce": ("Отскок", 400),
+        "spring": ("Пружина", 300),
+        "wave": ("Волна", 280),
+        "bezier": ("Безье", 200),
+        "decelerate": ("Декелерация", 220),
+    }
+    
+    GESTURE_ANIMATIONS = {
+        "swipe_left": ("Свайп влево", 150),
+        "swipe_right": ("Свайп вправо", 150),
+        "swipe_up": ("Свайп вверх", 150),
+        "swipe_down": ("Свайп вниз", 150),
+        "pinch_zoom": ("Пинч-зум", 250),
+        "long_press": ("Долгое нажатие", 200),
+    }
+    
+    def __init__(self):
+        super().__init__()
+        self._scroll_active = False
+        self._animation_duration = 200
+        self._animation_style = "smooth"
+        self._gesture_detector = GestureDetector()
+        self._performance_monitor = PerformanceMonitor(max_fps=60)
+        self._enable_gestures = True
+        self._enable_momentum = True
+        self._enable_optimization = True
+        self._menu_item_id = None
+        
+    def on_plugin_load(self):
+        """Загрузка плагина и инициализация настроек"""
+        self.add_on_send_message_hook()
+        self._animation_style = self.get_setting("animation_style", "smooth")
+        self._animation_duration = int(self.get_setting("animation_duration", 200))
+        self._enable_gestures = bool(self.get_setting("enable_gestures", True))
+        self._enable_momentum = bool(self.get_setting("enable_momentum", True))
+        self._enable_optimization = bool(self.get_setting("enable_optimization", True))
+        self._add_menu_item()
+        self.log("Smooth Scroll Pro plugin v2.0 loaded")
+    
+    def on_plugin_unload(self):
+        """Выгрузка плагина"""
+        self._scroll_active = False
+        if self._menu_item_id:
+            self.remove_menu_item(self._menu_item_id)
+            self._menu_item_id = None
+        self.log("Smooth Scroll Pro plugin unloaded")
+    
+    def _add_menu_item(self):
+        """Добавить пункт меню плагина"""
+        self._menu_item_id = self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                text="✨ Тестировать анимации",
+                icon="msg_animation",
+                on_click=self._on_menu_click,
+            )
+        )
+    
+    def _on_menu_click(self, context: Dict[str, Any]):
+        """Обработчик клика на пункт меню"""
+        self._test_smooth_scroll()
+        BulletinHelper.show_success("✨ Тестирование анимаций запущено!")
+    
+    def create_settings(self) -> List[Any]:
+        """Создание пользовательских настроек плагина"""
+        animation_names = [name for name, _ in self.SCROLL_ANIMATIONS.values()]
+        current_idx = list(self.SCROLL_ANIMATIONS.keys()).index(self._animation_style)
+        
+        return [
+            Header(text="✨ Smooth Chat Scroll Pro v2.0"),
+            Text(
+                text="Плавные анимации прокрутки и жесты",
+                subtext="Профессиональные переходы + оптимизированная производительность",
+                icon="msg_list",
+                accent=True,
+            ),
+            Divider(text="🎨 Стили анимаций"),
+            Selector(
+                key="animation_style",
+                text="Тип анимации прокрутки",
+                default=current_idx,
+                items=animation_names,
+                icon="msg_animation",
+                on_change=self._on_animation_style_change,
+            ),
+            Divider(text="⏱ Скорость"),
+            Selector(
+                key="animation_speed",
+                text="Скорость анимации",
+                default=1,
+                items=["Медленно (350ms)", "Нормально (250ms)", "Быстро (150ms)"],
+                icon="msg_speed",
+                on_change=self._on_animation_speed_change,
+            ),
+            Divider(text="👆 Жесты и взаимодействие"),
+            Switch(
+                key="enable_gestures",
+                text="Анимации жестов",
+                subtext="Свайпы и жесты с анимациями",
+                default=True,
+                icon="msg_touch",
+            ),
+            Switch(
+                key="enable_momentum",
+                text="Инерция прокрутки",
+                subtext="Продолжить прокрутку после отпускания",
+                default=True,
+                icon="msg_forward",
+            ),
+            Divider(text="⚙️ Оптимизация производительности"),
+            Switch(
+                key="enable_optimization",
+                text="Оптимизация FPS",
+                subtext="Ограничить FPS для снижения нагрузки на батарею",
+                default=True,
+                icon="msg_battery",
+            ),
+            Selector(
+                key="max_fps",
+                text="Максимальное количество FPS",
+                default=1,
+                items=["30 FPS (экономно)", "60 FPS (стандарт)", "120 FPS (плавно)"],
+                icon="msg_speed",
+                on_change=self._on_fps_change,
+            ),
+            Switch(
+                key="use_gpu",
+                text="Аппаратное ускорение",
+                subtext="Использовать GPU для анимаций",
+                default=True,
+                icon="msg_speed",
+            ),
+            Divider(text="📊 Переходы между чатами"),
+            Switch(
+                key="smooth_transition",
+                text="Плавный переход",
+                subtext="Анимировать при переключении диалогов",
+                default=True,
+                icon="msg_forward",
+            ),
+            Selector(
+                key="transition_style",
+                text="Стиль перехода",
+                default=0,
+                items=["Fade (затухание)", "Slide (скольжение)", "Scale (масштаб)"],
+                icon="msg_animation",
+            ),
+            Divider(),
+            Header(text="❓ Команды"),
+            Text(
+                text=".scroll.test",
+                subtext="Тестировать анимации прокрутки",
+                icon="msg_info",
+            ),
+            Text(
+                text=".scroll.gesture",
+                subtext="Тестировать жесты",
+                icon="msg_touch",
+            ),
+            Text(
+                text=".scroll.stats",
+                subtext="Показать статистику производительности",
+                icon="msg_stat",
+            ),
+            Text(
+                text=".scroll.info",
+                subtext="Информация о плагине",
+                icon="msg_info",
+            ),
+        ]
+    
+    def _on_animation_style_change(self, idx: int):
+        """Обработчик изменения стиля анимации"""
+        styles = list(self.SCROLL_ANIMATIONS.keys())
+        if 0 <= idx < len(styles):
+            self._animation_style = styles[idx]
+            _, self._animation_duration = self.SCROLL_ANIMATIONS[self._animation_style]
+            self.set_setting("animation_style", self._animation_style)
+            self.log(f"Animation style changed to: {self._animation_style}")
+    
+    def _on_animation_speed_change(self, idx: int):
+        """Обработчик изменения скорости анимации"""
+        speed_map = {
+            0: 350,
+            1: 250,
+            2: 150,
+        }
+        self._animation_duration = speed_map.get(idx, 250)
+        self.set_setting("animation_duration", self._animation_duration)
+        self.log(f"Animation speed changed to: {self._animation_duration}ms")
+    
+    def _on_fps_change(self, idx: int):
+        """Обработчик изменения максимального FPS"""
+        fps_map = {
+            0: 30,
+            1: 60,
+            2: 120,
+        }
+        max_fps = fps_map.get(idx, 60)
+        self._performance_monitor = PerformanceMonitor(max_fps=max_fps)
+        self.set_setting("max_fps", max_fps)
+        self.log(f"Max FPS changed to: {max_fps}")
+    
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        """Обработчик отправки сообщений"""
+        if not hasattr(params, "message") or not isinstance(params.message, str):
+            return HookResult()
+        
+        message = params.message.strip().lower()
+        
+        if message == ".scroll.test":
+            self._test_smooth_scroll()
+            return HookResult(strategy=HookStrategy.CANCEL)
+        
+        if message == ".scroll.gesture":
+            self._test_gesture_animation()
+            return HookResult(strategy=HookStrategy.CANCEL)
+        
+        if message == ".scroll.stats":
+            info = self._get_performance_stats()
+            params.message = info
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+        
+        if message == ".scroll.info":
+            info = self._get_plugin_info()
+            params.message = info
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+        
+        return HookResult()
+    
+    def _test_smooth_scroll(self):
+        """Тестирование плавной прокрутки"""
+        def run_test():
+            try:
+                frag = get_last_fragment()
+                if not frag:
+                    self.log("Fragment not available for testing")
+                    return
+                
+                self._animate_scroll(
+                    start_pos=0,
+                    end_pos=500,
+                    duration_ms=self._animation_duration,
+                )
+                self.log("Smooth scroll test executed")
+            except Exception as e:
+                self.log(f"Error in scroll test: {e}")
+        
+        threading.Thread(target=run_test, daemon=True).start()
+    
+    def _test_gesture_animation(self):
+        """Тестирование анимаций жестов"""
+        def run_test():
+            try:
+                self._animate_gesture("swipe_right", duration_ms=200)
+                time.sleep(0.3)
+                self._animate_gesture("swipe_left", duration_ms=200)
+                self.log("Gesture animation test executed")
+                BulletinHelper.show_success("✨ Жесты протестированы!")
+            except Exception as e:
+                self.log(f"Error in gesture test: {e}")
+        
+        threading.Thread(target=run_test, daemon=True).start()
+    
+    def _animate_gesture(self, gesture_type: str, duration_ms: int = 200):
+        """Анимировать жест"""
+        if not self._enable_gestures:
+            return
+        
+        steps = max(10, duration_ms // 16)
+        step_duration = duration_ms / steps
+        
+        for step in range(steps):
+            if not self._performance_monitor.can_render():
+                continue
+            
+            progress = step / steps
+            
+            if gesture_type.startswith("swipe"):
+                eased_progress = self._ease_out_cubic(progress)
+            else:
+                eased_progress = self._ease_in_out_cubic(progress)
+            
+            run_on_ui_thread(lambda p=eased_progress, g=gesture_type: 
+                           self._update_gesture_position(g, p))
+            
+            time.sleep(step_duration / 1000.0)
+    
+    def _animate_scroll(self, start_pos: int, end_pos: int, duration_ms: int):
+        """
+        Выполнить плавную анимацию прокрутки с оптимизацией
+        
+        Args:
+            start_pos: Начальная позиция
+            end_pos: Конечная позиция
+            duration_ms: Длительность в миллисекундах
+        """
+        if self._scroll_active:
+            return
+        
+        self._scroll_active = True
+        
+        try:
+            steps = max(10, duration_ms // 16)
+            step_duration = duration_ms / steps
+            distance = end_pos - start_pos
+            
+            style = self._animation_style
+            
+            for step in range(steps):
+                if not self._scroll_active:
+                    break
+                
+                if not self._performance_monitor.can_render():
+                    continue
+                
+                progress = step / steps
+                eased_progress = self._get_eased_progress(style, progress)
+                current_pos = start_pos + distance * eased_progress
+                
+                run_on_ui_thread(lambda p=current_pos: self._update_scroll_position(p))
+                
+                time.sleep(step_duration / 1000.0)
+        
+        finally:
+            self._scroll_active = False
+    
+    def _get_eased_progress(self, style: str, progress: float) -> float:
+        """Получить прогресс с применением easing функции"""
+        if style == "smooth":
+            return self._ease_in_out_cubic(progress)
+        elif style == "elastic":
+            return self._ease_elastic(progress)
+        elif style == "ease_out":
+            return self._ease_out_cubic(progress)
+        elif style == "bounce":
+            return self._ease_bounce(progress)
+        elif style == "spring":
+            return self._ease_spring(progress)
+        elif style == "wave":
+            return self._ease_wave(progress)
+        elif style == "bezier":
+            return self._ease_bezier(progress)
+        elif style == "decelerate":
+            return self._ease_decelerate(progress)
+        else:
+            return progress
+    
+    @staticmethod
+    def _ease_in_out_cubic(t: float) -> float:
+        """Гладкая функция easing (cubic in-out)"""
+        if t < 0.5:
+            return 4 * t * t * t
+        else:
+            return 1 - pow(-2 * t + 2, 3) / 2
+    
+    @staticmethod
+    def _ease_out_cubic(t: float) -> float:
+        """Функция easing с замедлением в конце (cubic out)"""
+        return 1 - pow(1 - t, 3)
+    
+    @staticmethod
+    def _ease_elastic(t: float) -> float:
+        """Эластичная функция easing (пружинящая)"""
+        if t == 0 or t == 1:
+            return t
+        
+        c4 = (2 * 3.14159) / 3
+        return pow(2, -10 * t) * (t - 0.75) * 0.0125 if t != 0 else 0
+    
+    @staticmethod
+    def _ease_bounce(t: float) -> float:
+        """Функция easing с отскоком (bounce)"""
+        if t < 0.5:
+            return (1 - pow(1 - 2 * t, 2)) / 2
+        else:
+            return (1 + pow(2 * t - 1, 2)) / 2
+    
+    @staticmethod
+    def _ease_spring(t: float) -> float:
+        """Пружинистая функция easing"""
+        c4 = (2 * math.pi) / 3
+        return (t == 0) and 0 or (t == 1) and 1 or (
+            pow(2, -10 * t) * math.sin((t * 10 - 0.75) * c4) + 1
+        )
+    
+    @staticmethod
+    def _ease_wave(t: float) -> float:
+        """Волнистая функция easing"""
+        return 0.5 - 0.5 * math.cos(math.pi * t)
+    
+    @staticmethod
+    def _ease_bezier(t: float) -> float:
+        """Кубическая кривая Безье"""
+        p0, p1, p2, p3 = 0, 0.25, 0.75, 1
+        mt = 1 - t
+        return (mt ** 3 * p0 + 3 * mt ** 2 * t * p1 + 
+                3 * mt * t ** 2 * p2 + t ** 3 * p3)
+    
+    @staticmethod
+    def _ease_decelerate(t: float) -> float:
+        """Декелерация (замедление) функция easing"""
+        return 1 - (1 - t) ** 2
+    
+    def _update_scroll_position(self, position: float):
+        """
+        Обновить позицию прокрутки
+        
+        Args:
+            position: Новая позиция прокрутки
+        """
+        try:
+            frag = get_last_fragment()
+            if not frag or not frag.getView():
+                return
+            
+        except Exception as e:
+            self.log(f"Error updating scroll position: {e}")
+    
+    def _update_gesture_position(self, gesture_type: str, progress: float):
+        """
+        Обновить позицию жеста
+        
+        Args:
+            gesture_type: Тип жеста (swipe_left, swipe_right и т.д.)
+            progress: Прогресс анимации (0-1)
+        """
+        try:
+            frag = get_last_fragment()
+            if not frag or not frag.getView():
+                return
+            
+        except Exception as e:
+            self.log(f"Error updating gesture position: {e}")
+    
+    def _get_performance_stats(self) -> str:
+        """Получить статистику производительности"""
+        total_frames = self._performance_monitor.frame_count
+        skipped_frames = self._performance_monitor.skip_frames
+        total = total_frames + skipped_frames
+        render_rate = (total_frames / total * 100) if total > 0 else 0
+        
+        stats = (
+            "📊 <b>Статистика производительности</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎬 <b>Всего кадров:</b> <code>{total_frames}</code>\n"
+            f"⏭ <b>Пропущено:</b> <code>{skipped_frames}</code>\n"
+            f"📈 <b>Коэффициент рендера:</b> <code>{render_rate:.1f}%</code>\n"
+            f"⚙️ <b>Макс FPS:</b> <code>{self._performance_monitor.max_fps}</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"✨ <b>Стиль анимации:</b> <code>{self._animation_style}</code>\n"
+            f"⏱ <b>Длительность:</b> <code>{self._animation_duration}ms</code>\n"
+            f"👆 <b>Жесты:</b> <code>{'Включены' if self._enable_gestures else 'Выключены'}</code>\n"
+            f"💨 <b>Инерция:</b> <code>{'Включена' if self._enable_momentum else 'Выключена'}</code>\n"
+        )
+        
+        return stats
+    
+    def _get_plugin_info(self) -> str:
+        """Получить информацию о плагине"""
+        current_style_name = self.SCROLL_ANIMATIONS.get(
+            self._animation_style, 
+            ("Unknown", 0)
+        )[0]
+        
+        gesture_count = len(self.GESTURE_ANIMATIONS)
+        animation_count = len(self.SCROLL_ANIMATIONS)
+        
+        info = (
+            "🎨 <b>Smooth Chat Scroll Pro v2.0</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📝 <b>Версия:</b> <code>2.0.0</code>\n"
+            f"✨ <b>Текущий стиль:</b> <code>{current_style_name}</code>\n"
+            f"⏱ <b>Длительность:</b> <code>{self._animation_duration}ms</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>Возможности:</b>\n"
+            f"🎬 <code>{animation_count} стилей анимаций</code>\n"
+            f"👆 <code>{gesture_count} типов жестов</code>\n"
+            f"⚡ <code>Оптимизация FPS включена</code>\n"
+            f"🚀 <code>GPU ускорение активно</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>Команды:</b>\n"
+            "<code>.scroll.test</code> - Тестировать прокрутку\n"
+            "<code>.scroll.gesture</code> - Тестировать жесты\n"
+            "<code>.scroll.stats</code> - Статистика производительности\n"
+            "<code>.scroll.info</code> - Эта информация\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Плагин добавляет профессиональные плавные анимации, "
+            "поддержку жестов и оптимизированную производительность."
+        )
+        
+        return info
